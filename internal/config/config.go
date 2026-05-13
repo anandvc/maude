@@ -28,6 +28,8 @@ type Config struct {
 	WaitPollInterval string `json:"wait_poll_interval" mapstructure:"wait_poll_interval"`
 	CaptureDelay     string `json:"capture_delay" mapstructure:"capture_delay"`
 	CaptureLines     int    `json:"capture_lines" mapstructure:"capture_lines"`
+	DaemonPoll       string `json:"daemon_poll" mapstructure:"daemon_poll"`
+	RequestTimeout   string `json:"request_timeout" mapstructure:"request_timeout"`
 }
 
 // Defaults returns Maude's built-in configuration defaults.
@@ -42,6 +44,8 @@ func Defaults() Config {
 		WaitPollInterval: "500ms",
 		CaptureDelay:     "250ms",
 		CaptureLines:     200,
+		DaemonPoll:       "500ms",
+		RequestTimeout:   "10m",
 	}
 }
 
@@ -104,6 +108,14 @@ func (c Config) CaptureDelayDuration() (time.Duration, error) {
 	return parseDuration("capture_delay", c.CaptureDelay)
 }
 
+func (c Config) DaemonPollDuration() (time.Duration, error) {
+	return parseDuration("daemon_poll", c.DaemonPoll)
+}
+
+func (c Config) RequestTimeoutDuration() (time.Duration, error) {
+	return parseDuration("request_timeout", c.RequestTimeout)
+}
+
 func parseDuration(name string, value string) (time.Duration, error) {
 	d, err := time.ParseDuration(value)
 	if err != nil {
@@ -127,6 +139,8 @@ func newViper(path string) *viper.Viper {
 	v.SetDefault("wait_poll_interval", cfg.WaitPollInterval)
 	v.SetDefault("capture_delay", cfg.CaptureDelay)
 	v.SetDefault("capture_lines", cfg.CaptureLines)
+	v.SetDefault("daemon_poll", cfg.DaemonPoll)
+	v.SetDefault("request_timeout", cfg.RequestTimeout)
 
 	return v
 }

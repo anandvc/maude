@@ -36,6 +36,8 @@ func TestSaveAndLoadPersistsJSON(t *testing.T) {
 	cfg.WaitPollInterval = "750ms"
 	cfg.CaptureDelay = "100ms"
 	cfg.CaptureLines = 75
+	cfg.DaemonPoll = "200ms"
+	cfg.RequestTimeout = "2m"
 
 	if err := Save(path, cfg); err != nil {
 		t.Fatalf("Save() error = %v", err)
@@ -73,6 +75,11 @@ func TestDurationHelpers(t *testing.T) {
 	cfg.WaitTimeout = "nope"
 	if _, err := cfg.WaitTimeoutDuration(); err == nil {
 		t.Fatal("WaitTimeoutDuration() error = nil, want parse error")
+	}
+
+	cfg = Defaults()
+	if got, err := cfg.RequestTimeoutDuration(); err != nil || got != 10*time.Minute {
+		t.Fatalf("RequestTimeoutDuration() = %v/%v, want 10m/nil", got, err)
 	}
 }
 

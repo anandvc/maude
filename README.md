@@ -2,7 +2,7 @@
 
 `maude` is a tiny `claude -p` compatibility shim for scripts, cronjobs, and shell pipelines.
 
-Instead of starting Claude Code in deprecated print mode, `maude -p` keeps a normal Claude Code TUI alive in a long-running tmux session, pastes each prompt into that pane, and captures the pane tail as best-effort output. The goal is a one-letter migration path for common automation: change `claude -p` to `maude -p`.
+Instead of starting Claude Code in deprecated print mode, `maude -p` queues the request for a small local daemon. The daemon keeps a normal Claude Code TUI alive in tmux, pastes an envelope into that pane, and tells the agent to complete the request with `maude agent print`. The goal is a one-letter migration path for common automation: change `claude -p` to `maude -p`.
 
 ![Maude architecture](docs/architecture.svg)
 
@@ -69,6 +69,20 @@ maude reset --session nightly
 
 `maude` stores its JSON config in `state/config.json` by default and session metadata in `state/sessions/`. The `state/` directory is gitignored.
 
+## Daemon Model
+
+`maude -p` is a short-lived client. It writes a request into `state/maude.db`, starts the daemon if needed, waits for its request ID, and prints the response.
+
+`maude daemon run` is the long-running worker. It is the only process that talks to tmux, so concurrent cronjobs and shell scripts do not race over the same Claude Code pane.
+
+Claude receives an envelope that includes a command like:
+
+```sh
+maude agent print --request <id>
+```
+
+When Claude pipes its final answer to that command, the waiting `maude -p` process receives the matching output.
+
 ## Notes
 
-Claude Code's TUI is not a machine-output protocol, so `maude` cannot guarantee byte-for-byte `claude -p` stdout compatibility. It does preserve the important automation behavior: accept a prompt, keep Claude warm, submit into a real Claude Code session, and report when the pane looks like it needs human intervention.
+Claude Code's TUI is not a machine-output protocol, so Maude avoids scrollback scraping for normal print responses. The TUI runtime sends the response back through `maude agent print`, which is much less fragile and lets multiple callers share the same long-running Claude Code session safely.

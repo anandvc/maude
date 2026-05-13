@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="780" height="190" viewBox="0 0 780 190" role="img" aria-labelledby="title desc">
   <title id="title">Maude architecture</title>
-  <desc id="desc">A shell command calls maude, which controls tmux, which runs Claude Code TUI, with state stored on disk.</desc>
+  <desc id="desc">A shell command enqueues work for the Maude daemon, which controls tmux and receives agent print responses from Claude Code.</desc>
   <defs>
     <marker id="arrow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
       <path d="M0,0 L10,4 L0,8 Z" fill="#334155"/>
@@ -13,28 +13,32 @@
       .arrow { stroke: #334155; stroke-width: 2; fill: none; marker-end: url(#arrow); }
     </style>
   </defs>
-  <rect x="20" y="45" width="130" height="70" class="box"/>
-  <text x="85" y="76" text-anchor="middle" class="label">script or CLI</text>
+  <rect x="20" y="45" width="120" height="70" class="box"/>
+  <text x="80" y="76" text-anchor="middle" class="label">script</text>
   <text x="85" y="96" text-anchor="middle" class="small">maude -p "..."</text>
 
-  <rect x="215" y="45" width="130" height="70" class="box"/>
-  <text x="280" y="76" text-anchor="middle" class="label">maude</text>
-  <text x="280" y="96" text-anchor="middle" class="small">Cobra + Viper</text>
+  <rect x="175" y="45" width="120" height="70" class="state"/>
+  <text x="235" y="76" text-anchor="middle" class="label">bbolt queue</text>
+  <text x="235" y="96" text-anchor="middle" class="small">request ID</text>
 
-  <rect x="410" y="45" width="130" height="70" class="box"/>
-  <text x="475" y="76" text-anchor="middle" class="label">tmux</text>
-  <text x="475" y="96" text-anchor="middle" class="small">persistent pane</text>
+  <rect x="330" y="45" width="120" height="70" class="box"/>
+  <text x="390" y="76" text-anchor="middle" class="label">mauded</text>
+  <text x="390" y="96" text-anchor="middle" class="small">serial worker</text>
 
-  <rect x="605" y="45" width="150" height="70" class="box"/>
-  <text x="680" y="76" text-anchor="middle" class="label">Claude Code</text>
-  <text x="680" y="96" text-anchor="middle" class="small">full TUI session</text>
+  <rect x="485" y="45" width="120" height="70" class="box"/>
+  <text x="545" y="76" text-anchor="middle" class="label">tmux</text>
+  <text x="545" y="96" text-anchor="middle" class="small">TUI pane</text>
 
-  <rect x="215" y="135" width="325" height="38" class="state"/>
-  <text x="377" y="159" text-anchor="middle" class="small">state/config.json + state/sessions/*.json</text>
+  <rect x="640" y="45" width="120" height="70" class="box"/>
+  <text x="700" y="76" text-anchor="middle" class="label">Claude Code</text>
+  <text x="700" y="96" text-anchor="middle" class="small">agent print</text>
 
-  <path d="M150 80 H205" class="arrow"/>
-  <path d="M345 80 H400" class="arrow"/>
-  <path d="M540 80 H595" class="arrow"/>
-  <path d="M280 116 V128" class="arrow"/>
-  <path d="M475 128 V116" class="arrow"/>
+  <rect x="175" y="135" width="430" height="38" class="state"/>
+  <text x="390" y="159" text-anchor="middle" class="small">state/config.json + state/maude.db + state/sessions/*.json</text>
+
+  <path d="M140 80 H165" class="arrow"/>
+  <path d="M295 80 H320" class="arrow"/>
+  <path d="M450 80 H475" class="arrow"/>
+  <path d="M605 80 H630" class="arrow"/>
+  <path d="M700 116 C700 160 640 160 615 160" class="arrow"/>
 </svg>

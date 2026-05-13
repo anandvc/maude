@@ -57,6 +57,18 @@ func (s Store) SessionPath(name string) string {
 	return filepath.Join(s.Root, "sessions", SafeName(name)+".json")
 }
 
+func (s Store) DBPath() string {
+	return filepath.Join(s.Root, "maude.db")
+}
+
+func (s Store) PIDPath() string {
+	return filepath.Join(s.Root, "mauded.pid")
+}
+
+func (s Store) LockPath() string {
+	return filepath.Join(s.Root, "mauded.lock")
+}
+
 func (s Store) SaveSession(sess Session) error {
 	now := time.Now().UTC()
 	if sess.CreatedAt.IsZero() {

@@ -6,11 +6,16 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/dorkitude/maude/internal/config"
+	"github.com/dorkitude/maude/internal/daemon"
 	"github.com/dorkitude/maude/internal/maude"
+	"github.com/dorkitude/maude/internal/queue"
 	"github.com/dorkitude/maude/internal/state"
 	"github.com/dorkitude/maude/internal/tmux"
 	"github.com/spf13/cobra"
@@ -106,13 +111,13 @@ func NewRootCommand() *cobra.Command {
 	cmd.PersistentFlags().StringVar(&opts.configPath, "config", "", "Path to Maude JSON config file")
 
 	flags := cmd.Flags()
-	flags.BoolVarP(&opts.print, "print", "p", false, "Paste prompt into Claude TUI, capture pane output, and exit")
+	flags.BoolVarP(&opts.print, "print", "p", false, "Queue prompt for Claude TUI, wait for agent print response, and exit")
 	flags.StringVar(&opts.session, "session", "", "Maude session name to route this prompt to")
 	flags.StringVarP(&opts.resume, "resume", "r", "", "Claude conversation/session to resume inside the tmux pane")
-	flags.BoolVar(&opts.noWait, "no-wait", false, "Paste prompt and return without waiting for pane capture")
+	flags.BoolVar(&opts.noWait, "no-wait", false, "Queue prompt and return the request ID without waiting for a response")
 	addCompatibilityFlags(flags)
 
-	cmd.AddCommand(newStatusCommand(opts), newAttachCommand(opts), newResetCommand(opts))
+	cmd.AddCommand(newStatusCommand(opts), newAttachCommand(opts), newResetCommand(opts), newAgentCommand(opts), newDaemonCommand(opts))
 	return cmd
 }
 
@@ -129,25 +134,36 @@ func runPrint(cmd *cobra.Command, opts *rootOptions, args []string) error {
 		return err
 	}
 	store := state.New(cfg.StateDir)
-	manager := maude.NewManager(cfg, store, tmux.New("tmux"))
+	q, err := queue.Open(store.DBPath())
+	if err != nil {
+		return err
+	}
+	defer q.Close()
+
 	cwd, _ := os.Getwd()
-	result, err := manager.RunPrint(context.Background(), maude.RunOptions{
+	req, err := q.Enqueue(queue.Request{
 		SessionName: opts.session,
 		Resume:      opts.resume,
 		Prompt:      prompt,
 		ClaudeArgs:  forwardArgs(cmd.Flags()),
-		NoWait:      opts.noWait,
 		Cwd:         cwd,
 	})
 	if err != nil {
 		return err
 	}
+	if err := daemon.New(opts.configPath, cfg).Start(); err != nil {
+		return err
+	}
+	if opts.noWait {
+		fmt.Fprintln(cmd.OutOrStdout(), req.ID)
+		return nil
+	}
+	result, err := waitForRequest(q, req.ID, cfg)
+	if err != nil {
+		return err
+	}
 	if result.Output != "" {
 		fmt.Fprintln(cmd.OutOrStdout(), result.Output)
-	}
-	if result.Intervention != "" {
-		fmt.Fprintf(cmd.ErrOrStderr(), "maude: %s\n", result.Intervention)
-		fmt.Fprintf(cmd.ErrOrStderr(), "maude: run `maude attach --session %s` to intervene.\n", result.Session.Name)
 	}
 	return nil
 }
@@ -243,6 +259,140 @@ func newResetCommand(parent *rootOptions) *cobra.Command {
 	return cmd
 }
 
+func newAgentCommand(parent *rootOptions) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:          "agent",
+		Short:        "Agent-facing commands used by pasted Maude envelopes",
+		SilenceUsage: true,
+	}
+	cmd.AddCommand(newAgentPrintCommand(parent))
+	return cmd
+}
+
+func newAgentPrintCommand(parent *rootOptions) *cobra.Command {
+	var requestID string
+	cmd := &cobra.Command{
+		Use:          "print",
+		Short:        "Complete a queued print request from stdin",
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if requestID == "" {
+				return fmt.Errorf("--request is required")
+			}
+			cfg, err := config.Load(parent.configPath)
+			if err != nil {
+				return err
+			}
+			data, err := io.ReadAll(cmd.InOrStdin())
+			if err != nil {
+				return err
+			}
+			q, err := queue.Open(state.New(cfg.StateDir).DBPath())
+			if err != nil {
+				return err
+			}
+			defer q.Close()
+			_, err = q.Complete(requestID, strings.TrimRight(string(data), "\n"))
+			return err
+		},
+	}
+	cmd.Flags().StringVar(&requestID, "request", "", "Queued Maude request ID")
+	return cmd
+}
+
+func newDaemonCommand(parent *rootOptions) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:          "daemon",
+		Short:        "Manage the Maude background worker",
+		SilenceUsage: true,
+	}
+	cmd.AddCommand(newDaemonRunCommand(parent), newDaemonStartCommand(parent), newDaemonStatusCommand(parent), newDaemonStopCommand(parent))
+	return cmd
+}
+
+func newDaemonRunCommand(parent *rootOptions) *cobra.Command {
+	return &cobra.Command{
+		Use:          "run",
+		Short:        "Run the Maude daemon in the foreground",
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := config.Load(parent.configPath)
+			if err != nil {
+				return err
+			}
+			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+			defer stop()
+			err = daemon.New(parent.configPath, cfg).Run(ctx)
+			if errorsIsContextDone(err) {
+				return nil
+			}
+			return err
+		},
+	}
+}
+
+func newDaemonStartCommand(parent *rootOptions) *cobra.Command {
+	return &cobra.Command{
+		Use:          "start",
+		Short:        "Start the Maude daemon in the background",
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := config.Load(parent.configPath)
+			if err != nil {
+				return err
+			}
+			if err := config.Save(configPath(parent.configPath), cfg); err != nil {
+				return err
+			}
+			if err := daemon.New(parent.configPath, cfg).Start(); err != nil {
+				return err
+			}
+			fmt.Fprintln(cmd.OutOrStdout(), "maude daemon started")
+			return nil
+		},
+	}
+}
+
+func newDaemonStatusCommand(parent *rootOptions) *cobra.Command {
+	return &cobra.Command{
+		Use:          "status",
+		Short:        "Show Maude daemon status",
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := config.Load(parent.configPath)
+			if err != nil {
+				return err
+			}
+			running, pid := daemon.New(parent.configPath, cfg).Running()
+			if running {
+				fmt.Fprintf(cmd.OutOrStdout(), "running pid=%d\n", pid)
+			} else {
+				fmt.Fprintln(cmd.OutOrStdout(), "stopped")
+			}
+			return nil
+		},
+	}
+}
+
+func newDaemonStopCommand(parent *rootOptions) *cobra.Command {
+	return &cobra.Command{
+		Use:          "stop",
+		Short:        "Stop the Maude daemon",
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := config.Load(parent.configPath)
+			if err != nil {
+				return err
+			}
+			if err := daemon.New(parent.configPath, cfg).Stop(); err != nil {
+				return err
+			}
+			fmt.Fprintln(cmd.OutOrStdout(), "maude daemon stopped")
+			return nil
+		},
+	}
+}
+
 func CollectPrompt(args []string, in io.Reader) (string, error) {
 	parts := make([]string, 0, 2)
 	if len(args) > 0 {
@@ -262,6 +412,36 @@ func CollectPrompt(args []string, in io.Reader) (string, error) {
 		return "", fmt.Errorf("no prompt provided")
 	}
 	return prompt, nil
+}
+
+func waitForRequest(q *queue.Queue, id string, cfg config.Config) (queue.Request, error) {
+	timeout, err := cfg.RequestTimeoutDuration()
+	if err != nil {
+		return queue.Request{}, err
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		req, err := q.Get(id)
+		if err != nil {
+			return queue.Request{}, err
+		}
+		switch req.Status {
+		case queue.StatusDone:
+			return req, nil
+		case queue.StatusFailed:
+			return queue.Request{}, fmt.Errorf("%s", req.Error)
+		case queue.StatusNeedsIntervention:
+			return queue.Request{}, fmt.Errorf("%s; run `maude attach --session %s` to intervene", req.Intervention, req.SessionName)
+		}
+		if timeout > 0 && time.Now().After(deadline) {
+			return queue.Request{}, fmt.Errorf("timed out waiting for request %s", id)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+}
+
+func errorsIsContextDone(err error) bool {
+	return err == nil || err == context.Canceled || err == context.DeadlineExceeded
 }
 
 func stdinHasData(in io.Reader) bool {

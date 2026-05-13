@@ -62,43 +62,10 @@ func (m Manager) RunPrint(ctx context.Context, opts RunOptions) (RunResult, erro
 	if strings.TrimSpace(opts.Prompt) == "" {
 		return RunResult{}, errors.New("prompt is empty")
 	}
-	sess := m.sessionFor(opts.SessionName, opts.Resume)
-	if existing, err := m.Store.LoadSession(sess.Name); err == nil {
-		sess = existing
-	} else if !os.IsNotExist(err) {
-		return RunResult{}, fmt.Errorf("load session state: %w", err)
-	}
-
-	has, err := m.Tmux.HasSession(ctx, sess.TmuxSession)
+	sess, err := m.Submit(ctx, opts)
 	if err != nil {
-		return RunResult{}, fmt.Errorf("check tmux session: %w", err)
+		return RunResult{}, err
 	}
-	if !has {
-		if err := m.Tmux.NewSession(ctx, sess.TmuxSession, opts.Cwd, m.claudeCommand(opts.Resume, opts.ClaudeArgs)); err != nil {
-			return RunResult{}, fmt.Errorf("start tmux session: %w", err)
-		}
-		sess.LastStatus = "created"
-		sess.ClaudeResume = opts.Resume
-		m.sleepConfig(m.Config.StartupWaitDuration)
-	} else {
-		sess.LastStatus = "reused"
-	}
-
-	if opts.Resume != "" && opts.Resume != sess.ClaudeResume {
-		if err := m.switchResume(ctx, sess.PaneTarget, opts.Resume, opts.ClaudeArgs); err != nil {
-			return RunResult{}, err
-		}
-		sess.ClaudeResume = opts.Resume
-		sess.LastStatus = "resumed"
-	}
-
-	if err := m.Tmux.PasteText(ctx, sess.PaneTarget, opts.Prompt); err != nil {
-		return RunResult{}, fmt.Errorf("paste prompt: %w", err)
-	}
-	if err := m.Tmux.SendKeys(ctx, sess.PaneTarget, "Enter"); err != nil {
-		return RunResult{}, fmt.Errorf("submit prompt: %w", err)
-	}
-	sess.LastPromptAt = m.Now()
 
 	result := RunResult{Session: sess}
 	if !opts.NoWait {
@@ -122,6 +89,53 @@ func (m Manager) RunPrint(ctx context.Context, opts RunOptions) (RunResult, erro
 		return RunResult{}, fmt.Errorf("save session state: %w", err)
 	}
 	return result, nil
+}
+
+func (m Manager) Submit(ctx context.Context, opts RunOptions) (state.Session, error) {
+	if strings.TrimSpace(opts.Prompt) == "" {
+		return state.Session{}, errors.New("prompt is empty")
+	}
+	sess := m.sessionFor(opts.SessionName, opts.Resume)
+	if existing, err := m.Store.LoadSession(sess.Name); err == nil {
+		sess = existing
+	} else if !os.IsNotExist(err) {
+		return state.Session{}, fmt.Errorf("load session state: %w", err)
+	}
+
+	has, err := m.Tmux.HasSession(ctx, sess.TmuxSession)
+	if err != nil {
+		return state.Session{}, fmt.Errorf("check tmux session: %w", err)
+	}
+	if !has {
+		if err := m.Tmux.NewSession(ctx, sess.TmuxSession, opts.Cwd, m.claudeCommand(opts.Resume, opts.ClaudeArgs)); err != nil {
+			return state.Session{}, fmt.Errorf("start tmux session: %w", err)
+		}
+		sess.LastStatus = "created"
+		sess.ClaudeResume = opts.Resume
+		m.sleepConfig(m.Config.StartupWaitDuration)
+	} else {
+		sess.LastStatus = "reused"
+	}
+
+	if opts.Resume != "" && opts.Resume != sess.ClaudeResume {
+		if err := m.switchResume(ctx, sess.PaneTarget, opts.Resume, opts.ClaudeArgs); err != nil {
+			return state.Session{}, err
+		}
+		sess.ClaudeResume = opts.Resume
+		sess.LastStatus = "resumed"
+	}
+
+	if err := m.Tmux.PasteText(ctx, sess.PaneTarget, opts.Prompt); err != nil {
+		return state.Session{}, fmt.Errorf("paste prompt: %w", err)
+	}
+	if err := m.Tmux.SendKeys(ctx, sess.PaneTarget, "Enter"); err != nil {
+		return state.Session{}, fmt.Errorf("submit prompt: %w", err)
+	}
+	sess.LastPromptAt = m.Now()
+	if err := m.Store.SaveSession(sess); err != nil {
+		return state.Session{}, fmt.Errorf("save session state: %w", err)
+	}
+	return sess, nil
 }
 
 func (m Manager) Reset(ctx context.Context, name string) error {
