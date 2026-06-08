@@ -125,17 +125,98 @@ func (m Manager) Submit(ctx context.Context, opts RunOptions) (state.Session, er
 		sess.LastStatus = "resumed"
 	}
 
-	if err := m.Tmux.PasteText(ctx, sess.PaneTarget, opts.Prompt); err != nil {
-		return state.Session{}, fmt.Errorf("paste prompt: %w", err)
-	}
-	if err := m.Tmux.SendKeys(ctx, sess.PaneTarget, "Enter"); err != nil {
-		return state.Session{}, fmt.Errorf("submit prompt: %w", err)
+	if err := m.submitPrompt(ctx, sess.PaneTarget, opts.Prompt); err != nil {
+		return state.Session{}, err
 	}
 	sess.LastPromptAt = m.Now()
 	if err := m.Store.SaveSession(sess); err != nil {
 		return state.Session{}, fmt.Errorf("save session state: %w", err)
 	}
 	return sess, nil
+}
+
+// maxPaneStablePolls bounds waitPaneStable so a pane that never settles (e.g. a
+// continuously animating spinner) cannot wedge submission forever.
+const maxPaneStablePolls = 20
+
+// submitPrompt pastes the prompt into the pane and reliably submits it.
+//
+// The Claude Code TUI ingests pasted text via bracketed paste. Sending Enter
+// before the paste has been fully ingested races the TUI: the keystroke lands
+// mid-ingestion and is swallowed, leaving the prompt sitting unsubmitted in the
+// input box. The caller (`maude -p`) then waits for output that never comes and
+// hangs until its timeout. This was observed intermittently on the multi-line
+// print-request envelope.
+//
+// We make submission deterministic:
+//  1. Paste, then wait for the pane to stop changing — the paste is fully
+//     rendered before we touch the keyboard.
+//  2. Send Enter, then confirm the turn actually started. A real submit clears
+//     the (multi-line) input box and Claude begins working, so the pane diverges
+//     from the settled snapshot. While it still matches, the Enter was swallowed,
+//     so we re-send it, up to SubmitRetries times.
+//
+// Confirmation is chrome-agnostic: it never parses the prompt glyph or theme,
+// only whether the pane content moved after the keystroke.
+func (m Manager) submitPrompt(ctx context.Context, target, prompt string) error {
+	if err := m.Tmux.PasteText(ctx, target, prompt); err != nil {
+		return fmt.Errorf("paste prompt: %w", err)
+	}
+	settled := m.waitPaneStable(ctx, target)
+	if err := m.Tmux.SendKeys(ctx, target, "Enter"); err != nil {
+		return fmt.Errorf("submit prompt: %w", err)
+	}
+	m.confirmSubmitted(ctx, target, settled)
+	return nil
+}
+
+// waitPaneStable polls the pane until two consecutive non-empty captures are
+// identical (the paste has finished rendering), bounded by maxPaneStablePolls.
+// Returns the settled snapshot (or the last seen content if it never settles).
+func (m Manager) waitPaneStable(ctx context.Context, target string) string {
+	poll, err := m.Config.CaptureDelayDuration()
+	if err != nil {
+		poll = 0
+	}
+	var previous string
+	for i := 0; i < maxPaneStablePolls; i++ {
+		current, err := m.Tmux.CapturePane(ctx, target, m.Config.CaptureLines)
+		if err != nil {
+			return previous
+		}
+		if current == previous && current != "" {
+			return current
+		}
+		previous = current
+		m.sleep(poll)
+	}
+	return previous
+}
+
+// confirmSubmitted verifies the Enter registered and re-sends it if it was
+// swallowed by the paste race. After a real submit the input box clears and
+// Claude begins the turn, so the pane diverges from `settled`; while it still
+// matches, we re-send Enter, up to SubmitRetries times. Best-effort and never
+// fatal — the caller still waits for output, and a false negative costs at most
+// one extra Enter on an already-submitted (now empty) input, which is a no-op.
+func (m Manager) confirmSubmitted(ctx context.Context, target, settled string) {
+	poll, err := m.Config.WaitPollIntervalDuration()
+	if err != nil {
+		poll = 0
+	}
+	for i := 0; i < m.Config.SubmitRetries; i++ {
+		m.sleep(poll)
+		current, err := m.Tmux.CapturePane(ctx, target, m.Config.CaptureLines)
+		if err != nil {
+			return
+		}
+		if current != settled {
+			return // turn underway → submit registered
+		}
+		if err := m.Tmux.SendKeys(ctx, target, "Enter"); err != nil {
+			return
+		}
+	}
 }
 
 func (m Manager) Reset(ctx context.Context, name string) error {
