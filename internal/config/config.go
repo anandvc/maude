@@ -31,6 +31,11 @@ type Config struct {
 	CaptureLines     int    `json:"capture_lines" mapstructure:"capture_lines"`
 	DaemonPoll       string `json:"daemon_poll" mapstructure:"daemon_poll"`
 	RequestTimeout   string `json:"request_timeout" mapstructure:"request_timeout"`
+
+	// SubmitRetries is how many times Submit re-sends Enter when it detects the
+	// pasted prompt was not submitted (the bracketed-paste/Enter race). 0 keeps
+	// the legacy fire-once behavior.
+	SubmitRetries int `json:"submit_retries" mapstructure:"submit_retries"`
 }
 
 // Defaults returns Maude's built-in configuration defaults.
@@ -48,6 +53,7 @@ func Defaults() Config {
 		CaptureLines:     200,
 		DaemonPoll:       "500ms",
 		RequestTimeout:   "10m",
+		SubmitRetries:    3,
 	}
 }
 
@@ -144,6 +150,7 @@ func newViper(path string) *viper.Viper {
 	v.SetDefault("capture_lines", cfg.CaptureLines)
 	v.SetDefault("daemon_poll", cfg.DaemonPoll)
 	v.SetDefault("request_timeout", cfg.RequestTimeout)
+	v.SetDefault("submit_retries", cfg.SubmitRetries)
 
 	return v
 }

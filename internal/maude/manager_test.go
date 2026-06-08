@@ -13,6 +13,7 @@ import (
 type fakeTmux struct {
 	has      bool
 	captures []string
+	last     string
 	calls    []string
 }
 
@@ -40,10 +41,17 @@ func (f *fakeTmux) PasteText(_ context.Context, _ string, text string) error {
 func (f *fakeTmux) CapturePane(context.Context, string, int) (string, error) {
 	f.calls = append(f.calls, "capture")
 	if len(f.captures) == 0 {
+		// Sticky: once the script is exhausted, keep returning the last value so
+		// the new settle/confirm polling sees a stable pane instead of a sudden
+		// sentinel change.
+		if f.last != "" {
+			return f.last, nil
+		}
 		return "done", nil
 	}
 	out := f.captures[0]
 	f.captures = f.captures[1:]
+	f.last = out
 	return out, nil
 }
 
@@ -135,6 +143,82 @@ func TestRunPrintDetectsIntervention(t *testing.T) {
 	}
 	if res.Intervention == "" {
 		t.Fatal("Intervention is empty")
+	}
+}
+
+// enterPaneTmux simulates the bracketed-paste/Enter race: the pane keeps
+// showing the unsubmitted prompt until `acceptAfter` Enter keystrokes have
+// landed, after which the turn begins and the pane content changes.
+type enterPaneTmux struct {
+	has         bool
+	acceptAfter int
+	enters      int
+	calls       []string
+}
+
+func (f *enterPaneTmux) HasSession(context.Context, string) (bool, error) { return f.has, nil }
+
+func (f *enterPaneTmux) NewSession(context.Context, string, string, []string) error {
+	f.has = true
+	return nil
+}
+
+func (f *enterPaneTmux) SendKeys(_ context.Context, _ string, keys ...string) error {
+	for _, k := range keys {
+		if k == "Enter" {
+			f.enters++
+		}
+	}
+	f.calls = append(f.calls, append([]string{"keys"}, keys...)...)
+	return nil
+}
+
+func (f *enterPaneTmux) PasteText(context.Context, string, string) error { return nil }
+
+func (f *enterPaneTmux) CapturePane(context.Context, string, int) (string, error) {
+	if f.enters < f.acceptAfter {
+		return "unsubmitted-envelope", nil
+	}
+	return "claude is working", nil
+}
+
+func (f *enterPaneTmux) KillSession(context.Context, string) error { return nil }
+
+// A swallowed first Enter (the live hang) must be detected and re-sent.
+func TestSubmitRetriesSwallowedEnter(t *testing.T) {
+	t.Parallel()
+
+	cfg := testConfig()
+	cfg.SubmitRetries = 3
+	ft := &enterPaneTmux{has: true, acceptAfter: 2} // first Enter is swallowed
+	m := NewManager(cfg, state.New(t.TempDir()), ft)
+	m.Sleep = func(time.Duration) {}
+
+	_, err := m.RunPrint(context.Background(), RunOptions{Prompt: "hi", NoWait: true})
+	if err != nil {
+		t.Fatalf("RunPrint() error = %v", err)
+	}
+	if ft.enters != 2 {
+		t.Fatalf("enters = %d, want 2 (one swallowed + one resend)", ft.enters)
+	}
+}
+
+// A submit accepted on the first Enter must NOT trigger extra keystrokes.
+func TestSubmitNoResendWhenAccepted(t *testing.T) {
+	t.Parallel()
+
+	cfg := testConfig()
+	cfg.SubmitRetries = 3
+	ft := &enterPaneTmux{has: true, acceptAfter: 1} // first Enter lands
+	m := NewManager(cfg, state.New(t.TempDir()), ft)
+	m.Sleep = func(time.Duration) {}
+
+	_, err := m.RunPrint(context.Background(), RunOptions{Prompt: "hi", NoWait: true})
+	if err != nil {
+		t.Fatalf("RunPrint() error = %v", err)
+	}
+	if ft.enters != 1 {
+		t.Fatalf("enters = %d, want 1 (accepted on first Enter)", ft.enters)
 	}
 }
 
