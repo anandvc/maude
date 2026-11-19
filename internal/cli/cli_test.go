@@ -251,3 +251,43 @@ func TestStreamAgentPrintAppendsOutputBeforeComplete(t *testing.T) {
 		t.Fatalf("request = %#v", got)
 	}
 }
+
+// Regression (PR #2 review): `daemon run` must start with a read-only config
+// whose state_dir is already absolute; it must not attempt a write at all.
+func TestPersistResolvedStateDirSkipsUnchangedAndToleratesReadOnly(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	cfg := config.Defaults()
+	cfg.StateDir = filepath.Join(dir, "state")
+	if err := config.Save(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(dir, 0o755)
+	before, _ := os.ReadFile(path)
+
+	var warn bytes.Buffer
+	if persistResolvedStateDir(&warn, path, cfg, cfg) {
+		t.Fatal("unchanged absolute state_dir must not be rewritten")
+	}
+	if warn.Len() != 0 {
+		t.Fatalf("unexpected warning: %q", warn.String())
+	}
+
+	// A relative on-disk value that needs migrating, but the dir is read-only:
+	// warn, do not fail, and leave the file untouched.
+	raw := cfg
+	raw.StateDir = "state"
+	if persistResolvedStateDir(&warn, path, raw, cfg) {
+		t.Fatal("write into a read-only dir must not report success")
+	}
+	if !strings.Contains(warn.String(), "could not persist") {
+		t.Fatalf("expected a warning, got %q", warn.String())
+	}
+	after, _ := os.ReadFile(path)
+	if !bytes.Equal(before, after) {
+		t.Fatal("config changed despite failed write")
+	}
+}

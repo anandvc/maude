@@ -346,15 +346,19 @@ func newDaemonRunCommand(parent *rootOptions) *cobra.Command {
 		Short:        "Run the Maude daemon in the foreground",
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, err := loadConfig(parent.configPath)
+			raw, err := config.Load(parent.configPath)
 			if err != nil {
 				return err
 			}
-			// Persist the absolutized state_dir so a foreground/manual daemon
-			// migrates the on-disk config just like `daemon start` and runPrint do.
-			if err := config.Save(configPath(parent.configPath), cfg); err != nil {
+			cfg, err := resolveStateDir(raw, parent.configPath)
+			if err != nil {
 				return err
 			}
+			// Migrate a relative on-disk state_dir to the resolved absolute one,
+			// but only when it actually changes, and never fail startup over it:
+			// the daemon already runs with the resolved value in memory, and a
+			// read-only config with an absolute state_dir must keep working.
+			persistResolvedStateDir(cmd.ErrOrStderr(), configPath(parent.configPath), raw, cfg)
 			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
 			err = daemon.New(parent.configPath, cfg).Run(ctx)
@@ -798,4 +802,18 @@ func resolveStateDir(cfg config.Config, configPath string) (config.Config, error
 		return cfg, fmt.Errorf("resolve state_dir: get working directory: %w", err)
 	}
 	return cfg.ResolveStateDir(cwd), nil
+}
+
+// persistResolvedStateDir writes cfg back to path only when resolution changed
+// the on-disk state_dir. It is best-effort: a write failure (e.g. a read-only
+// config) is reported to warn and does not stop the caller.
+func persistResolvedStateDir(warn io.Writer, path string, raw, cfg config.Config) bool {
+	if raw.StateDir == cfg.StateDir {
+		return false
+	}
+	if err := config.Save(path, cfg); err != nil {
+		fmt.Fprintf(warn, "maude: warning: could not persist absolute state_dir to %s: %v\n", path, err)
+		return false
+	}
+	return true
 }
