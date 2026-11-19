@@ -3,6 +3,8 @@ package cli
 import (
 	"bytes"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -10,6 +12,72 @@ import (
 	"github.com/dorkitude/maude/internal/config"
 	"github.com/dorkitude/maude/internal/queue"
 )
+
+// TestResolveStateDirConventionIsCWDIndependent is the core regression test for
+// the "request not found" divergence bug: an absolute --config that follows the
+// <state_dir>/config.json convention must resolve to the SAME absolute state dir
+// no matter which CWD the process runs from (enqueuer vs daemon vs the in-pane /
+// Stop-hook `agent print`). Pre-migration the on-disk state_dir is still "state".
+func TestResolveStateDirConventionIsCWDIndependent(t *testing.T) {
+	cfg := config.Defaults() // StateDir == "state" (relative)
+	abs := "/Users/anandvc/.shimmer-sessions/chatX/state/config.json"
+	want := "/Users/anandvc/.shimmer-sessions/chatX/state"
+
+	// Run the resolution from two different working directories; the convention
+	// anchor must ignore CWD entirely and pick the config file's directory.
+	for _, cwd := range []string{t.TempDir(), os.TempDir()} {
+		dir, err := os.Getwd()
+		if err != nil {
+			t.Fatalf("Getwd: %v", err)
+		}
+		if err := os.Chdir(cwd); err != nil {
+			t.Fatalf("Chdir(%s): %v", cwd, err)
+		}
+		got, err := resolveStateDir(cfg, abs)
+		_ = os.Chdir(dir)
+		if err != nil {
+			t.Fatalf("resolveStateDir: %v", err)
+		}
+		if got.StateDir != want {
+			t.Fatalf("from cwd %s: StateDir = %q, want %q", cwd, got.StateDir, want)
+		}
+	}
+}
+
+func TestResolveStateDirOutOfTreeFallsBackToCWD(t *testing.T) {
+	cfg := config.Defaults() // StateDir "state"
+	// An out-of-tree --config NOT at <state_dir>/config.json -> historical CWD anchor.
+	cwd := t.TempDir()
+	orig, _ := os.Getwd()
+	if err := os.Chdir(cwd); err != nil {
+		t.Fatalf("Chdir: %v", err)
+	}
+	defer os.Chdir(orig)
+	got, err := resolveStateDir(cfg, "/etc/maude/custom.json")
+	if err != nil {
+		t.Fatalf("resolveStateDir: %v", err)
+	}
+	// t.TempDir() can be a symlink (/var -> /private/var on macOS); compare resolved.
+	want := filepath.Join(cwd, "state")
+	gotEval, _ := filepath.EvalSymlinks(got.StateDir)
+	wantEval, _ := filepath.EvalSymlinks(want)
+	if gotEval != wantEval {
+		t.Fatalf("StateDir = %q, want %q", got.StateDir, want)
+	}
+}
+
+func TestResolveStateDirAbsoluteUntouched(t *testing.T) {
+	t.Parallel()
+	cfg := config.Defaults()
+	cfg.StateDir = "/abs/state"
+	got, err := resolveStateDir(cfg, "/anywhere/state/config.json")
+	if err != nil {
+		t.Fatalf("resolveStateDir: %v", err)
+	}
+	if got.StateDir != "/abs/state" {
+		t.Fatalf("absolute StateDir mutated: %q", got.StateDir)
+	}
+}
 
 func TestCollectPromptFromArgs(t *testing.T) {
 	t.Parallel()

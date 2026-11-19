@@ -61,6 +61,43 @@ func TestSaveAndLoadPersistsJSON(t *testing.T) {
 	}
 }
 
+func TestResolveStateDir(t *testing.T) {
+	t.Parallel()
+
+	// Relative StateDir is anchored to baseDir.
+	cfg := Defaults() // StateDir == "state"
+	got := cfg.ResolveStateDir("/base/chat")
+	if want := filepath.Join("/base/chat", "state"); got.StateDir != want {
+		t.Fatalf("relative ResolveStateDir = %q, want %q", got.StateDir, want)
+	}
+
+	// Absolute StateDir is left untouched.
+	cfg = Defaults()
+	cfg.StateDir = "/abs/state"
+	if got := cfg.ResolveStateDir("/base/chat"); got.StateDir != "/abs/state" {
+		t.Fatalf("absolute ResolveStateDir = %q, want /abs/state", got.StateDir)
+	}
+
+	// Empty baseDir leaves the value untouched (no CWD lookup).
+	cfg = Defaults()
+	if got := cfg.ResolveStateDir(""); got.StateDir != "state" {
+		t.Fatalf("empty baseDir ResolveStateDir = %q, want state", got.StateDir)
+	}
+
+	// Empty StateDir falls back to the default name under baseDir.
+	cfg = Defaults()
+	cfg.StateDir = ""
+	if got := cfg.ResolveStateDir("/base/chat"); got.StateDir != filepath.Join("/base/chat", "state") {
+		t.Fatalf("empty StateDir ResolveStateDir = %q, want /base/chat/state", got.StateDir)
+	}
+
+	// Idempotent: resolving an already-resolved config does not re-anchor.
+	cfg = Defaults().ResolveStateDir("/base/chat")
+	if again := cfg.ResolveStateDir("/other/cwd"); again.StateDir != filepath.Join("/base/chat", "state") {
+		t.Fatalf("ResolveStateDir not idempotent: %q", again.StateDir)
+	}
+}
+
 func TestDurationHelpers(t *testing.T) {
 	t.Parallel()
 
