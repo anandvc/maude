@@ -3,3 +3,4 @@ plan.md
 /maude
 dist/
 coverage.out
+.DS_Store

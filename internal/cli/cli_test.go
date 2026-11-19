@@ -3,6 +3,8 @@ package cli
 import (
 	"bytes"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -10,6 +12,72 @@ import (
 	"github.com/dorkitude/maude/internal/config"
 	"github.com/dorkitude/maude/internal/queue"
 )
+
+// TestResolveStateDirConventionIsCWDIndependent is the core regression test for
+// the "request not found" divergence bug: an absolute --config that follows the
+// <state_dir>/config.json convention must resolve to the SAME absolute state dir
+// no matter which CWD the process runs from (enqueuer vs daemon vs the in-pane /
+// Stop-hook `agent print`). Pre-migration the on-disk state_dir is still "state".
+func TestResolveStateDirConventionIsCWDIndependent(t *testing.T) {
+	cfg := config.Defaults() // StateDir == "state" (relative)
+	abs := "/Users/anandvc/.shimmer-sessions/chatX/state/config.json"
+	want := "/Users/anandvc/.shimmer-sessions/chatX/state"
+
+	// Run the resolution from two different working directories; the convention
+	// anchor must ignore CWD entirely and pick the config file's directory.
+	for _, cwd := range []string{t.TempDir(), os.TempDir()} {
+		dir, err := os.Getwd()
+		if err != nil {
+			t.Fatalf("Getwd: %v", err)
+		}
+		if err := os.Chdir(cwd); err != nil {
+			t.Fatalf("Chdir(%s): %v", cwd, err)
+		}
+		got, err := resolveStateDir(cfg, abs)
+		_ = os.Chdir(dir)
+		if err != nil {
+			t.Fatalf("resolveStateDir: %v", err)
+		}
+		if got.StateDir != want {
+			t.Fatalf("from cwd %s: StateDir = %q, want %q", cwd, got.StateDir, want)
+		}
+	}
+}
+
+func TestResolveStateDirOutOfTreeFallsBackToCWD(t *testing.T) {
+	cfg := config.Defaults() // StateDir "state"
+	// An out-of-tree --config NOT at <state_dir>/config.json -> historical CWD anchor.
+	cwd := t.TempDir()
+	orig, _ := os.Getwd()
+	if err := os.Chdir(cwd); err != nil {
+		t.Fatalf("Chdir: %v", err)
+	}
+	defer os.Chdir(orig)
+	got, err := resolveStateDir(cfg, "/etc/maude/custom.json")
+	if err != nil {
+		t.Fatalf("resolveStateDir: %v", err)
+	}
+	// t.TempDir() can be a symlink (/var -> /private/var on macOS); compare resolved.
+	want := filepath.Join(cwd, "state")
+	gotEval, _ := filepath.EvalSymlinks(got.StateDir)
+	wantEval, _ := filepath.EvalSymlinks(want)
+	if gotEval != wantEval {
+		t.Fatalf("StateDir = %q, want %q", got.StateDir, want)
+	}
+}
+
+func TestResolveStateDirAbsoluteUntouched(t *testing.T) {
+	t.Parallel()
+	cfg := config.Defaults()
+	cfg.StateDir = "/abs/state"
+	got, err := resolveStateDir(cfg, "/anywhere/state/config.json")
+	if err != nil {
+		t.Fatalf("resolveStateDir: %v", err)
+	}
+	if got.StateDir != "/abs/state" {
+		t.Fatalf("absolute StateDir mutated: %q", got.StateDir)
+	}
+}
 
 func TestCollectPromptFromArgs(t *testing.T) {
 	t.Parallel()
@@ -181,5 +249,60 @@ func TestStreamAgentPrintAppendsOutputBeforeComplete(t *testing.T) {
 	}
 	if got.Status != queue.StatusDone || got.Output != "hello" {
 		t.Fatalf("request = %#v", got)
+	}
+}
+
+// Regression (PR #2 review): `daemon run` must start with a read-only config
+// whose state_dir is already absolute; it must not attempt a write at all. A
+// failed migration is tolerated only when the state dir is anchored by the
+// config's own location; a CWD-dependent one must refuse to start.
+func TestPersistResolvedStateDir(t *testing.T) {
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "state")
+	if err := os.MkdirAll(stateDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	conventional := filepath.Join(stateDir, "config.json") // <state_dir>/config.json
+	other := filepath.Join(root, "cfg", "maude.json")      // not the convention
+
+	write := func(path string, cfg config.Config) {
+		if err := config.Save(path, cfg); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(filepath.Dir(path), 0o555); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { os.Chmod(filepath.Dir(path), 0o755) })
+	}
+	abs := config.Defaults()
+	abs.StateDir = stateDir
+	rel := config.Defaults()
+	rel.StateDir = "state"
+
+	// 1. Already absolute + read-only: no write, no warning.
+	write(other, abs)
+	var warn bytes.Buffer
+	if err := persistResolvedStateDir(&warn, other, abs, abs); err != nil || warn.Len() != 0 {
+		t.Fatalf("unchanged state_dir: err=%v warn=%q", err, warn.String())
+	}
+
+	// 2. Relative but anchored by the config location: warn and continue.
+	write(conventional, rel)
+	before, _ := os.ReadFile(conventional)
+	if err := persistResolvedStateDir(&warn, conventional, rel, abs); err != nil {
+		t.Fatalf("anchored state_dir must not block startup: %v", err)
+	}
+	if !strings.Contains(warn.String(), "could not persist") {
+		t.Fatalf("expected a warning, got %q", warn.String())
+	}
+	if after, _ := os.ReadFile(conventional); !bytes.Equal(before, after) {
+		t.Fatal("config changed despite failed write")
+	}
+
+	// 3. Relative and CWD-dependent: refuse to start.
+	other2 := filepath.Join(root, "cfg2", "maude.json")
+	write(other2, rel)
+	if err := persistResolvedStateDir(&warn, other2, rel, abs); err == nil {
+		t.Fatal("CWD-dependent state_dir with unwritable config must refuse to start")
 	}
 }

@@ -101,6 +101,15 @@ func NewRootCommand() *cobra.Command {
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		Args:          cobra.ArbitraryArgs,
+		// Resolve --config to an absolute path BEFORE any subcommand runs. The
+		// daemon and the in-pane `agent print` completer are spawned with this
+		// exact string (daemon.go embeds it into the RespondWith command); if it
+		// stays relative, each re-resolves it against its own CWD and opens a
+		// different config (hence a different state/maude.db) than the enqueuer.
+		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+			opts.configPath = absConfigPath(opts.configPath)
+			return nil
+		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if !opts.print {
 				return cmd.Help()
@@ -128,7 +137,7 @@ func runPrint(cmd *cobra.Command, opts *rootOptions, args []string) error {
 	if err != nil {
 		return err
 	}
-	cfg, err := config.Load(opts.configPath)
+	cfg, err := loadConfig(opts.configPath)
 	if err != nil {
 		return err
 	}
@@ -189,7 +198,7 @@ func newStatusCommand(parent *rootOptions) *cobra.Command {
 		Short:        "Show Maude session state",
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, err := config.Load(parent.configPath)
+			cfg, err := loadConfig(parent.configPath)
 			if err != nil {
 				return err
 			}
@@ -227,7 +236,7 @@ func newAttachCommand(parent *rootOptions) *cobra.Command {
 		Short:        "Attach to a Maude tmux session",
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, err := config.Load(parent.configPath)
+			cfg, err := loadConfig(parent.configPath)
 			if err != nil {
 				return err
 			}
@@ -254,7 +263,7 @@ func newResetCommand(parent *rootOptions) *cobra.Command {
 		Short:        "Kill a Maude tmux session and delete its state",
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, err := config.Load(parent.configPath)
+			cfg, err := loadConfig(parent.configPath)
 			if err != nil {
 				return err
 			}
@@ -293,7 +302,7 @@ func newAgentPrintCommand(parent *rootOptions) *cobra.Command {
 			if requestID == "" {
 				return fmt.Errorf("--request is required")
 			}
-			cfg, err := config.Load(parent.configPath)
+			cfg, err := loadConfig(parent.configPath)
 			if err != nil {
 				return err
 			}
@@ -337,8 +346,20 @@ func newDaemonRunCommand(parent *rootOptions) *cobra.Command {
 		Short:        "Run the Maude daemon in the foreground",
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, err := config.Load(parent.configPath)
+			raw, err := config.Load(parent.configPath)
 			if err != nil {
+				return err
+			}
+			cfg, err := resolveStateDir(raw, parent.configPath)
+			if err != nil {
+				return err
+			}
+			// Migrate a relative on-disk state_dir to the resolved absolute one,
+			// only when it actually changes. A failed write is tolerated only if
+			// every other process (print completer, Stop hook) would resolve the
+			// same state dir from the config path alone; otherwise they could open
+			// a different queue, so refuse to start.
+			if err := persistResolvedStateDir(cmd.ErrOrStderr(), configPath(parent.configPath), raw, cfg); err != nil {
 				return err
 			}
 			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -358,7 +379,7 @@ func newDaemonStartCommand(parent *rootOptions) *cobra.Command {
 		Short:        "Start the Maude daemon in the background",
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, err := config.Load(parent.configPath)
+			cfg, err := loadConfig(parent.configPath)
 			if err != nil {
 				return err
 			}
@@ -380,7 +401,7 @@ func newDaemonStatusCommand(parent *rootOptions) *cobra.Command {
 		Short:        "Show Maude daemon status",
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, err := config.Load(parent.configPath)
+			cfg, err := loadConfig(parent.configPath)
 			if err != nil {
 				return err
 			}
@@ -401,7 +422,7 @@ func newDaemonStopCommand(parent *rootOptions) *cobra.Command {
 		Short:        "Stop the Maude daemon",
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, err := config.Load(parent.configPath)
+			cfg, err := loadConfig(parent.configPath)
 			if err != nil {
 				return err
 			}
@@ -720,4 +741,105 @@ func configPath(path string) string {
 		return path
 	}
 	return filepath.Join(config.DefaultStateDir, config.DefaultConfigFileName)
+}
+
+// absConfigPath makes the --config value absolute, anchored to the current CWD.
+// Empty -> the default state/config.json under CWD. This is what lets the daemon
+// and the in-pane `agent print` completer (both spawned with this string) open
+// the SAME config — and therefore the same state/maude.db — as the enqueuer,
+// regardless of the CWD each runs in.
+func absConfigPath(path string) string {
+	if path == "" {
+		path = configPath("")
+	}
+	if abs, err := filepath.Abs(path); err == nil {
+		return abs
+	}
+	return path
+}
+
+// loadConfig loads config from path and pins StateDir to an absolute location so
+// the request queue DB is CWD-invariant across the enqueuer, daemon, and print
+// completer. See resolveStateDir for the anchoring rules.
+func loadConfig(path string) (config.Config, error) {
+	cfg, err := config.Load(path)
+	if err != nil {
+		return cfg, err
+	}
+	return resolveStateDir(cfg, path)
+}
+
+// resolveStateDir makes cfg.StateDir absolute. An already-absolute value is
+// returned untouched. For a relative value there are two anchors:
+//
+//  1. If the (absolute) config path follows maude's convention of living AT
+//     <StateDir>/config.json, the absolute state dir is exactly the config
+//     file's directory. This anchor is CWD-INDEPENDENT — it's what lets the
+//     external Stop hook and the in-pane `agent print` (which pass an absolute
+//     --config but may run from a different CWD) resolve to the SAME DB the
+//     enqueuer used, even before the config has been migrated to an absolute
+//     state_dir on disk.
+//  2. Otherwise (an out-of-tree --config decoupled from StateDir) fall back to
+//     maude's historical behavior: anchor to the process CWD. This requires a
+//     working directory; a Getwd failure is surfaced rather than silently
+//     leaving the path relative (which would reintroduce the divergence bug).
+func resolveStateDir(cfg config.Config, configPath string) (config.Config, error) {
+	if cfg.StateDir == "" || filepath.IsAbs(cfg.StateDir) {
+		if cfg.StateDir == "" {
+			// Preserve the documented default, made absolute below.
+			cfg.StateDir = config.DefaultStateDir
+		} else {
+			return cfg, nil
+		}
+	}
+	if configPath != "" && filepath.IsAbs(configPath) {
+		conventional := filepath.Join(cfg.StateDir, config.DefaultConfigFileName)
+		if configPath == conventional ||
+			strings.HasSuffix(configPath, string(filepath.Separator)+conventional) {
+			cfg.StateDir = filepath.Dir(configPath)
+			return cfg, nil
+		}
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return cfg, fmt.Errorf("resolve state_dir: get working directory: %w", err)
+	}
+	return cfg.ResolveStateDir(cwd), nil
+}
+
+// persistResolvedStateDir writes cfg back to path only when resolution changed
+// the on-disk state_dir. If that write fails, it warns and returns nil when the
+// state dir is anchored by the config file's own location (CWD-independent, so
+// every process resolves the same queue); otherwise it returns an error.
+func persistResolvedStateDir(warn io.Writer, path string, raw, cfg config.Config) error {
+	if raw.StateDir == cfg.StateDir {
+		return nil
+	}
+	err := config.Save(path, cfg)
+	if err == nil {
+		return nil
+	}
+	if stateDirAnchoredByConfig(raw, path) {
+		fmt.Fprintf(warn, "maude: warning: could not persist absolute state_dir to %s: %v\n", path, err)
+		return nil
+	}
+	return fmt.Errorf("persist absolute state_dir %s to %s (required so all maude processes share one queue): %w", cfg.StateDir, path, err)
+}
+
+// stateDirAnchoredByConfig reports whether resolveStateDir derives the state
+// dir purely from the config path (the <state_dir>/config.json convention).
+func stateDirAnchoredByConfig(raw config.Config, path string) bool {
+	dir := raw.StateDir
+	if dir == "" {
+		dir = config.DefaultStateDir
+	}
+	if filepath.IsAbs(dir) {
+		return true
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return false
+	}
+	conventional := filepath.Join(dir, config.DefaultConfigFileName)
+	return abs == conventional || strings.HasSuffix(abs, string(filepath.Separator)+conventional)
 }

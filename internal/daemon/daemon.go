@@ -203,9 +203,17 @@ func (s Service) process(ctx context.Context, q *queue.Queue, manager maude.Mana
 	}
 }
 
+// canonicalConfigPath returns an absolute config path. The daemon embeds this
+// string into the in-pane `agent print` command (see process > RespondWith); a
+// relative path there would resolve against the TUI pane's CWD — typically
+// different from the enqueuer's — and open a different state/maude.db, so the
+// just-enqueued request is "not found" and the print channel never completes.
 func canonicalConfigPath(path string) string {
 	if path == "" {
-		return config.DefaultPath()
+		path = config.DefaultPath()
+	}
+	if abs, err := filepath.Abs(path); err == nil {
+		return abs
 	}
 	return path
 }

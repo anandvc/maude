@@ -62,6 +62,31 @@ func DefaultPath() string {
 	return filepath.Join(DefaultStateDir, DefaultConfigFileName)
 }
 
+// ResolveStateDir returns a copy of c with StateDir made absolute, anchoring a
+// relative value to baseDir. The bbolt request queue (state/maude.db) and the
+// per-session JSON files live under StateDir, and THREE independent processes
+// open them: the `maude -p` enqueuer, the daemon, and the in-pane `agent print`
+// completer. Each can run with a different CWD, so a relative StateDir resolves
+// to a different file per process — the enqueued request then can't be found by
+// the print channel ("request not found"), the channel never completes, and the
+// caller times out. Pinning StateDir to an absolute path (persisted via Save)
+// makes the DB location CWD-invariant across all three. A baseDir of "" leaves
+// the value untouched.
+func (c Config) ResolveStateDir(baseDir string) Config {
+	if baseDir == "" {
+		return c
+	}
+	dir := c.StateDir
+	if dir == "" {
+		dir = DefaultStateDir
+	}
+	if !filepath.IsAbs(dir) {
+		dir = filepath.Join(baseDir, dir)
+	}
+	c.StateDir = dir
+	return c
+}
+
 // Load reads config from path, applying defaults for missing values. If path is
 // empty, state/config.json is used. A missing config file is not an error.
 func Load(path string) (Config, error) {
@@ -94,7 +119,30 @@ func Save(path string, cfg Config) error {
 		return fmt.Errorf("encode config: %w", err)
 	}
 	data = append(data, '\n')
-	if err := os.WriteFile(path, data, 0o644); err != nil {
+	// Write atomically: a concurrent reader (daemon, print completer) must
+	// never see a truncated config.
+	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("write config: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return fmt.Errorf("write config: %w", err)
+	}
+	mode := os.FileMode(0o644)
+	if info, err := os.Stat(path); err == nil {
+		mode = info.Mode().Perm() // keep e.g. a private 0600 config private
+	}
+	if err := tmp.Chmod(mode); err != nil {
+		tmp.Close()
+		return fmt.Errorf("write config: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("write config: %w", err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
 		return fmt.Errorf("write config: %w", err)
 	}
 	return nil
