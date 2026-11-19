@@ -355,10 +355,13 @@ func newDaemonRunCommand(parent *rootOptions) *cobra.Command {
 				return err
 			}
 			// Migrate a relative on-disk state_dir to the resolved absolute one,
-			// but only when it actually changes, and never fail startup over it:
-			// the daemon already runs with the resolved value in memory, and a
-			// read-only config with an absolute state_dir must keep working.
-			persistResolvedStateDir(cmd.ErrOrStderr(), configPath(parent.configPath), raw, cfg)
+			// only when it actually changes. A failed write is tolerated only if
+			// every other process (print completer, Stop hook) would resolve the
+			// same state dir from the config path alone; otherwise they could open
+			// a different queue, so refuse to start.
+			if err := persistResolvedStateDir(cmd.ErrOrStderr(), configPath(parent.configPath), raw, cfg); err != nil {
+				return err
+			}
 			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
 			err = daemon.New(parent.configPath, cfg).Run(ctx)
@@ -805,15 +808,38 @@ func resolveStateDir(cfg config.Config, configPath string) (config.Config, error
 }
 
 // persistResolvedStateDir writes cfg back to path only when resolution changed
-// the on-disk state_dir. It is best-effort: a write failure (e.g. a read-only
-// config) is reported to warn and does not stop the caller.
-func persistResolvedStateDir(warn io.Writer, path string, raw, cfg config.Config) bool {
+// the on-disk state_dir. If that write fails, it warns and returns nil when the
+// state dir is anchored by the config file's own location (CWD-independent, so
+// every process resolves the same queue); otherwise it returns an error.
+func persistResolvedStateDir(warn io.Writer, path string, raw, cfg config.Config) error {
 	if raw.StateDir == cfg.StateDir {
-		return false
+		return nil
 	}
-	if err := config.Save(path, cfg); err != nil {
+	err := config.Save(path, cfg)
+	if err == nil {
+		return nil
+	}
+	if stateDirAnchoredByConfig(raw, path) {
 		fmt.Fprintf(warn, "maude: warning: could not persist absolute state_dir to %s: %v\n", path, err)
+		return nil
+	}
+	return fmt.Errorf("persist absolute state_dir %s to %s (required so all maude processes share one queue): %w", cfg.StateDir, path, err)
+}
+
+// stateDirAnchoredByConfig reports whether resolveStateDir derives the state
+// dir purely from the config path (the <state_dir>/config.json convention).
+func stateDirAnchoredByConfig(raw config.Config, path string) bool {
+	dir := raw.StateDir
+	if dir == "" {
+		dir = config.DefaultStateDir
+	}
+	if filepath.IsAbs(dir) {
+		return true
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
 		return false
 	}
-	return true
+	conventional := filepath.Join(dir, config.DefaultConfigFileName)
+	return abs == conventional || strings.HasSuffix(abs, string(filepath.Separator)+conventional)
 }

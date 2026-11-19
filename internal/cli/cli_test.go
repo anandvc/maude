@@ -253,41 +253,56 @@ func TestStreamAgentPrintAppendsOutputBeforeComplete(t *testing.T) {
 }
 
 // Regression (PR #2 review): `daemon run` must start with a read-only config
-// whose state_dir is already absolute; it must not attempt a write at all.
-func TestPersistResolvedStateDirSkipsUnchangedAndToleratesReadOnly(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "config.json")
-	cfg := config.Defaults()
-	cfg.StateDir = filepath.Join(dir, "state")
-	if err := config.Save(path, cfg); err != nil {
+// whose state_dir is already absolute; it must not attempt a write at all. A
+// failed migration is tolerated only when the state dir is anchored by the
+// config's own location; a CWD-dependent one must refuse to start.
+func TestPersistResolvedStateDir(t *testing.T) {
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "state")
+	if err := os.MkdirAll(stateDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chmod(dir, 0o555); err != nil {
-		t.Fatal(err)
-	}
-	defer os.Chmod(dir, 0o755)
-	before, _ := os.ReadFile(path)
+	conventional := filepath.Join(stateDir, "config.json") // <state_dir>/config.json
+	other := filepath.Join(root, "cfg", "maude.json")      // not the convention
 
+	write := func(path string, cfg config.Config) {
+		if err := config.Save(path, cfg); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(filepath.Dir(path), 0o555); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { os.Chmod(filepath.Dir(path), 0o755) })
+	}
+	abs := config.Defaults()
+	abs.StateDir = stateDir
+	rel := config.Defaults()
+	rel.StateDir = "state"
+
+	// 1. Already absolute + read-only: no write, no warning.
+	write(other, abs)
 	var warn bytes.Buffer
-	if persistResolvedStateDir(&warn, path, cfg, cfg) {
-		t.Fatal("unchanged absolute state_dir must not be rewritten")
-	}
-	if warn.Len() != 0 {
-		t.Fatalf("unexpected warning: %q", warn.String())
+	if err := persistResolvedStateDir(&warn, other, abs, abs); err != nil || warn.Len() != 0 {
+		t.Fatalf("unchanged state_dir: err=%v warn=%q", err, warn.String())
 	}
 
-	// A relative on-disk value that needs migrating, but the dir is read-only:
-	// warn, do not fail, and leave the file untouched.
-	raw := cfg
-	raw.StateDir = "state"
-	if persistResolvedStateDir(&warn, path, raw, cfg) {
-		t.Fatal("write into a read-only dir must not report success")
+	// 2. Relative but anchored by the config location: warn and continue.
+	write(conventional, rel)
+	before, _ := os.ReadFile(conventional)
+	if err := persistResolvedStateDir(&warn, conventional, rel, abs); err != nil {
+		t.Fatalf("anchored state_dir must not block startup: %v", err)
 	}
 	if !strings.Contains(warn.String(), "could not persist") {
 		t.Fatalf("expected a warning, got %q", warn.String())
 	}
-	after, _ := os.ReadFile(path)
-	if !bytes.Equal(before, after) {
+	if after, _ := os.ReadFile(conventional); !bytes.Equal(before, after) {
 		t.Fatal("config changed despite failed write")
+	}
+
+	// 3. Relative and CWD-dependent: refuse to start.
+	other2 := filepath.Join(root, "cfg2", "maude.json")
+	write(other2, rel)
+	if err := persistResolvedStateDir(&warn, other2, rel, abs); err == nil {
+		t.Fatal("CWD-dependent state_dir with unwritable config must refuse to start")
 	}
 }

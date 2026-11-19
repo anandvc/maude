@@ -131,7 +131,11 @@ func Save(path string, cfg Config) error {
 		tmp.Close()
 		return fmt.Errorf("write config: %w", err)
 	}
-	if err := tmp.Chmod(0o644); err != nil {
+	mode := os.FileMode(0o644)
+	if info, err := os.Stat(path); err == nil {
+		mode = info.Mode().Perm() // keep e.g. a private 0600 config private
+	}
+	if err := tmp.Chmod(mode); err != nil {
 		tmp.Close()
 		return fmt.Errorf("write config: %w", err)
 	}
